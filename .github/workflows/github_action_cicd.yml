@@ -1,0 +1,94 @@
+name: Build, Push Docker Image and Deploy them on AKS
+
+# Trigger workflow manually (workflow_dispatch) for now
+on:
+  # pull_request: # Uncomment if you want to run on PR
+  # push: # Uncomment if you want to run on push to main branch
+  #   branches:
+  #     - main
+  workflow_dispatch:
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Step to check out the repository code
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    # Set up Docker Buildx to build multi-platform images
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    # Log in to Azure account using service principal credentials stored in secrets
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    # Log in to Azure Container Registry (ACR) to push Docker images
+    - name: Log in to Azure Container Registry
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ secrets.REGISTRY_NAME }}.azurecr.io
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+
+    # Set SHORT_SHA environment variable with the first 8 characters of the commit SHA for tagging images
+    - name: Add SHORT_SHA env property with commit short sha
+      run: echo "SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-8`" >> $GITHUB_ENV
+
+    # Build and push the Docker image for the frontend application to ACR
+    - name: Build and push Frontend image
+      uses: docker/build-push-action@v3
+      with:
+        context: ./frontend # Path to frontend Dockerfile
+        push: true # Push the image to ACR with lastest and commit hash tag
+        tags: |
+          ${{ secrets.REGISTRY_NAME }}.azurecr.io/${{ secrets.REPOSITORY_NAME }}/frontend:latest
+          ${{ secrets.REGISTRY_NAME }}.azurecr.io/${{ secrets.REPOSITORY_NAME }}/frontend:${{ env.SHORT_SHA }}
+
+    # Build and push the Docker image for the backend application to ACR
+    - name: Build and push Backend image
+      uses: docker/build-push-action@v3
+      with:
+        context: ./backend # Path to backend Dockerfile
+        push: true # Push the image to ACR with lastest and commit hash tag
+        tags: |
+          ${{ secrets.REGISTRY_NAME }}.azurecr.io/${{ secrets.REPOSITORY_NAME }}/backend:latest
+          ${{ secrets.REGISTRY_NAME }}.azurecr.io/${{ secrets.REPOSITORY_NAME }}/backend:${{ env.SHORT_SHA }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build # Deploy job depends on successful completion of the build job
+
+    steps:
+    # Step to check out the repository code
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    # Log in to Azure to access AKS and other resources
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    # Set SHORT_SHA environment variable again in the deploy job (shared between jobs)
+    - name: Add SHORT_SHA env property with commit short sha
+      run: echo "SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-8`" >> $GITHUB_ENV
+  
+    # Install kubectl command-line tool to interact with AKS
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    # Retrieve AKS cluster credentials for kubectl commands
+    - name: Get AKS credentials
+      run: az aks get-credentials --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --name ${{ secrets.AKS_CLUSTER_NAME }}
+
+    # Deploy the application using Helm charts, and update the image with the tag from SHORT_SHA
+    - name: Deploy Helm chart
+      run: |
+        helm upgrade --install sample ./helm-chart --set namespace="staging" --set image.tag="${{ env.SHORT_SHA }}"
